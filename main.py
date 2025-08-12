@@ -4,112 +4,272 @@ import xml.etree.ElementTree as ET
 import re
 from xml.dom import minidom
 
+def add_missing_columns_to_sxml(missing_columns, ddl_string, sxml_string):
+    """
+    Parses the DDL for missing columns, generates their SXML representation,
+    and adds them to the main SXML string.
+
+    Args:
+        missing_columns (set): A set of uppercase column names missing from the SXML.
+        ddl_string (str): The full DDL content.
+        sxml_string (str): The original SXML string.
+
+    Returns:
+        str: The updated SXML string with the new columns added.
+    """
+    new_col_items = []
+    # Find the full CREATE TABLE block to parse from
+    create_table_match = re.search(r'CREATE\s+TABLE\s+.*?\((.*)\)', ddl_string, re.DOTALL | re.IGNORECASE)
+    if not create_table_match:
+        return sxml_string # Cannot proceed without a DDL block
+
+    columns_block = create_table_match.group(1)
+    
+    for col_name in missing_columns:
+        # Find the full definition line for the missing column
+        # This regex looks for a line starting with the quoted column name
+        col_def_match = re.search(r'^\s*"' + re.escape(col_name) + r'"\s+(.*?)(,|$)', columns_block, re.MULTILINE | re.IGNORECASE)
+        if not col_def_match:
+            continue
+
+        col_def = col_def_match.group(1).strip()
+        
+        # Build the SXML fragment for this column
+        item_xml = f'      <COL_LIST_ITEM>\n        <NAME>{col_name}</NAME>\n'
+        
+        # Handle different data types
+        type_def_upper = col_def.upper()
+        if type_def_upper.startswith('VARCHAR2'):
+            item_xml += '        <DATATYPE>VARCHAR2</DATATYPE>\n'
+            length_match = re.search(r'\((\d+)', col_def)
+            if length_match:
+                item_xml += f'        <LENGTH>{length_match.group(1)}</LENGTH>\n'
+            item_xml += '        <CHAR_SEMANTICS></CHAR_SEMANTICS>\n'
+            item_xml += '        <COLLATE_NAME>USING_NLS_COMP</COLLATE_NAME>\n'
+        elif type_def_upper.startswith('NUMBER'):
+            item_xml += '        <DATATYPE>NUMBER</DATATYPE>\n'
+            precision_match = re.search(r'\((\d+),(\d+)\)', col_def)
+            if precision_match:
+                item_xml += f'        <PRECISION>{precision_match.group(1)}</PRECISION>\n'
+                item_xml += f'        <SCALE>{precision_match.group(2)}</SCALE>\n'
+        elif type_def_upper.startswith('DATE'):
+            item_xml += '        <DATATYPE>DATE</DATATYPE>\n'
+        elif type_def_upper.startswith('CLOB'):
+            item_xml += '        <DATATYPE>CLOB</DATATYPE>\n'
+            item_xml += '        <COLLATE_NAME>USING_NLS_COMP</COLLATE_NAME>\n'
+        elif type_def_upper.startswith('BLOB'):
+            item_xml += '        <DATATYPE>BLOB</DATATYPE>\n'
+
+        if 'NOT NULL' in type_def_upper:
+            item_xml += '        <NOT_NULL></NOT_NULL>\n'
+            
+        item_xml += '      </COL_LIST_ITEM>\n'
+        new_col_items.append(item_xml)
+
+    # Insert the new column items into the main SXML string before the closing </COL_LIST>
+    if new_col_items:
+        col_list_end_tag = '</COL_LIST>'
+        # Use find() to get the FIRST occurrence, which is the main column list
+        insertion_point = sxml_string.find(col_list_end_tag)
+        if insertion_point != -1:
+            updated_sxml = sxml_string[:insertion_point] + "".join(new_col_items) + sxml_string[insertion_point:]
+            return updated_sxml
+
+    return sxml_string
+
+
 def compare_ddl_and_sxml_columns(ddl_string, sxml_string):
     """
-    Compares column definitions between the DDL (CREATE TABLE statement)
-    and the SXML metadata.
+    Performs a deep comparison of columns between DDL and SXML, checking for
+    existence, data types, and attributes.
 
     Args:
         ddl_string (str): The SQL DDL content from the file.
         sxml_string (str): The SXML content from the snapshot.
 
     Returns:
-        tuple: A tuple containing (messages, columns_in_ddl_only, columns_in_sxml_only).
+        tuple: A tuple containing (messages, in_ddl_not_in_sxml, in_sxml_not_in_ddl, attribute_mismatches).
     """
     messages = []
+    ddl_cols = {}
+    sxml_cols = {}
     
-    # 1. Extract columns from the DDL using regex
-    ddl_columns = set()
+    # 1. Parse DDL to extract detailed column attributes
     create_table_match = re.search(r'CREATE\s+TABLE\s+.*?\((.*)\)', ddl_string, re.DOTALL | re.IGNORECASE)
     if create_table_match:
         columns_block = create_table_match.group(1)
-        found_columns = re.findall(r'^\s*"([^"]+)"', columns_block, re.MULTILINE)
-        ddl_columns = set(c.upper() for c in found_columns)
+        # Regex to capture column name and its full definition on the same line
+        col_definitions = re.findall(r'^\s*"([^"]+)"\s+(.*?)(?:,|$)', columns_block, re.MULTILINE | re.IGNORECASE)
+        for name, definition in col_definitions:
+            name = name.upper()
+            ddl_cols[name] = {'not_null': 'NOT NULL' in definition.upper()}
+            
+            type_def = definition.split()[0].upper()
+            if type_def.startswith('VARCHAR2'):
+                ddl_cols[name]['type'] = 'VARCHAR2'
+                length_match = re.search(r'\((\d+)', definition)
+                ddl_cols[name]['length'] = length_match.group(1) if length_match else None
+            elif type_def.startswith('NUMBER'):
+                ddl_cols[name]['type'] = 'NUMBER'
+                match = re.match(r'NUMBER\((\d+),(\d+)\)', type_def)
+                if match:
+                    ddl_cols[name]['precision'] = match.group(1)
+                    ddl_cols[name]['scale'] = match.group(2)
+                else:
+                    match = re.match(r'NUMBER\((\d+)\)', type_def)
+                    if match:
+                        ddl_cols[name]['precision'] = match.group(1)
+                        ddl_cols[name]['scale'] = '0' # Oracle default
+            elif type_def.startswith('DATE'):
+                ddl_cols[name]['type'] = 'DATE'
+            elif type_def.startswith('CLOB'):
+                ddl_cols[name]['type'] = 'CLOB'
+            elif type_def.startswith('BLOB'):
+                ddl_cols[name]['type'] = 'BLOB'
 
-    # 2. Extract columns from the SXML using an XML parser
-    sxml_columns = set()
+    # 2. Parse SXML to extract detailed column attributes
     try:
         root = ET.fromstring(sxml_string)
-        # Define the namespace from the SXML, as it uses a default namespace
         ns = {'ku': 'http://xmlns.oracle.com/ku'}
-        # Use the namespace in the XPath query to correctly find the elements
-        for item in root.findall('.//ku:COL_LIST/ku:COL_LIST_ITEM/ku:NAME', ns):
-            if item.text:
-                sxml_columns.add(item.text.strip().upper())
+        main_col_list = root.find('.//ku:RELATIONAL_TABLE/ku:COL_LIST', ns)
+        if main_col_list is not None:
+            for item in main_col_list.findall('./ku:COL_LIST_ITEM', ns):
+                name_node = item.find('ku:NAME', ns)
+                if name_node is not None and name_node.text:
+                    name = name_node.text.strip().upper()
+                    sxml_cols[name] = {
+                        'type': item.findtext('ku:DATATYPE', '', ns),
+                        'length': item.findtext('ku:LENGTH', None, ns),
+                        'precision': item.findtext('ku:PRECISION', None, ns),
+                        'scale': item.findtext('ku:SCALE', None, ns),
+                        'not_null': item.find('ku:NOT_NULL', ns) is not None
+                    }
     except ET.ParseError:
         messages.append("  COMPARISON FAILED: Could not parse SXML to extract columns.")
-        return messages, set(), set()
+        return messages, set(), set(), []
 
-    # 3. Compare the two sets of columns
-    if not ddl_columns:
-        messages.append("  COMPARISON WARNING: Could not find any columns in the DDL CREATE TABLE statement.")
+    # 3. Compare the two dictionaries
+    ddl_col_names = set(ddl_cols.keys())
+    sxml_col_names = set(sxml_cols.keys())
     
-    in_ddl_not_in_sxml = ddl_columns - sxml_columns
-    in_sxml_not_in_ddl = sxml_columns - ddl_columns
+    in_ddl_not_in_sxml = ddl_col_names - sxml_col_names
+    in_sxml_not_in_ddl = sxml_col_names - ddl_col_names
+    attribute_mismatches = []
 
     if in_ddl_not_in_sxml:
         messages.append(f"  Discrepancy: Columns in DDL but not in SXML -> {sorted(list(in_ddl_not_in_sxml))}")
     
     if in_sxml_not_in_ddl:
         messages.append(f"  Discrepancy: Columns in SXML but not in DDL -> {sorted(list(in_sxml_not_in_ddl))}")
-        
-    if not in_ddl_not_in_sxml and not in_sxml_not_in_ddl and ddl_columns:
-        if not any("Discrepancy" in m or "WARNING" in m for m in messages):
-             messages.append(f"  Column Check: OK. All {len(ddl_columns)} columns match between DDL and SXML.")
 
-    return messages, in_ddl_not_in_sxml, in_sxml_not_in_ddl
+    # 4. Check for attribute mismatches on common columns
+    common_cols = ddl_col_names.intersection(sxml_col_names)
+    for col in common_cols:
+        ddl_attr = ddl_cols[col]
+        sxml_attr = sxml_cols[col]
+        mismatches = []
+        
+        # Compare attributes
+        if ddl_attr.get('type') != sxml_attr.get('type'):
+            mismatches.append(f"Type mismatch: DDL='{ddl_attr.get('type')}', SXML='{sxml_attr.get('type')}'")
+        if ddl_attr.get('length') != sxml_attr.get('length'):
+            mismatches.append(f"Length mismatch: DDL='{ddl_attr.get('length')}', SXML='{sxml_attr.get('length')}'")
+        if ddl_attr.get('precision') != sxml_attr.get('precision'):
+            mismatches.append(f"Precision mismatch: DDL='{ddl_attr.get('precision')}', SXML='{sxml_attr.get('precision')}'")
+        if ddl_attr.get('scale') != sxml_attr.get('scale'):
+            mismatches.append(f"Scale mismatch: DDL='{ddl_attr.get('scale')}', SXML='{sxml_attr.get('scale')}'")
+        if ddl_attr.get('not_null') != sxml_attr.get('not_null'):
+            mismatches.append(f"NOT NULL mismatch: DDL='{ddl_attr.get('not_null')}', SXML='{sxml_attr.get('not_null')}'")
+            
+        if mismatches:
+            messages.append(f"  Attribute Mismatch on column '{col}': {'; '.join(mismatches)}")
+            attribute_mismatches.append({'column': col, 'details': mismatches})
+
+    return messages, in_ddl_not_in_sxml, in_sxml_not_in_ddl, attribute_mismatches
 
 
 def get_start_with_value(schema, table_name):
-    """
-    Generates the START_WITH value for an identity column.
-    For now, it returns a static value.
-
-    Args:
-        schema (str): The schema name from the SXML.
-        table_name (str): The table name from the SXML.
-
-    Returns:
-        int: The value for the START_WITH tag.
-    """
-    # This function can be expanded later if needed.
     return 1
 
-def parse_sql_snapshot_files(root_folder):
+def fix_identity_column(sxml_string):
     """
-    Traverses a directory tree, finds *.sql files, and processes them
-    to find and parse a '-- sqlcl_snapshot' line. Only reports on files
-    with issues.
-
-    Args:
-        root_folder (str): The absolute or relative path to the folder
-                           to start searching from.
+    Checks for and fixes a missing IDENTITY_COLUMN closing tag.
+    
+    Returns:
+        tuple: (corrected_sxml_string, message)
     """
-    # Check if the provided root_folder exists and is a directory
-    if not os.path.isdir(root_folder):
-        print(f"Error: The specified folder '{root_folder}' does not exist or is not a directory.")
-        return
+    open_count = sxml_string.count('<IDENTITY_COLUMN>')
+    close_count = sxml_string.count('</IDENTITY_COLUMN>')
 
-    print(f"Starting scan in folder: '{root_folder}'.")
-    print("IMPORTANT: This script will modify files in place if corrections are made.\n")
+    if open_count > close_count:
+        schema_match = re.search(r'<SCHEMA>(.*?)</SCHEMA>', sxml_string)
+        name_match = re.search(r'<NAME>(.*?)</NAME>', sxml_string)
+        if schema_match and name_match:
+            schema = schema_match.group(1)
+            table_name = name_match.group(1)
+            start_with_val = get_start_with_value(schema, table_name)
+            tags_to_add = f"""<GENERATION>DEFAULT</GENERATION><ON_NULL></ON_NULL><START_WITH>{start_with_val}</START_WITH><INCREMENT>1</INCREMENT><MINVALUE>1</MINVALUE><MAXVALUE>9999999999999999999999999999</MAXVALUE><CACHE>20</CACHE></IDENTITY_COLUMN>"""
+            
+            start_pos = sxml_string.find('<IDENTITY_COLUMN>')
+            schema_end_tag = '</SCHEMA>'
+            schema_end_pos = sxml_string.find(schema_end_tag, start_pos)
+            
+            if schema_end_pos != -1:
+                insertion_point = schema_end_pos + len(schema_end_tag)
+                corrected_sxml = sxml_string[:insertion_point] + tags_to_add + sxml_string[insertion_point:]
+                try:
+                    ET.fromstring(corrected_sxml)
+                    message = "File updated. Added missing </IDENTITY_COLUMN> tag."
+                    return corrected_sxml, message
+                except ET.ParseError:
+                    return None, "SXML still invalid after IDENTITY_COLUMN fix."
+    return None, None
 
-    # os.walk() efficiently traverses the directory tree (top-down)
-    for dirpath, _, filenames in os.walk(root_folder):
-        for filename in filenames:
-            # Check if the file has a .sql extension
-            if filename.endswith(".sql"):
-                # Construct the full path to the file
-                file_path = os.path.join(dirpath, filename)
-                process_single_file(file_path)
+
+def generate_log_file(file_path, ddl_content, original_sxml, corrected_sxml, discrepancies):
+    """
+    Creates a detailed .log file for a given SQL file with discrepancies.
+    """
+    in_ddl, in_sxml, mismatches = discrepancies
+    try:
+        log_file_path = os.path.splitext(file_path)[0] + ".log"
+        with open(log_file_path, 'w', encoding='utf-8') as log_f:
+            log_f.write("<!--\n  Discrepancy Report\n\n")
+            if in_ddl:
+                log_f.write(f"  - Columns in DDL but not SXML: {sorted(list(in_ddl))}\n")
+            if in_sxml:
+                log_f.write(f"  - Columns in SXML but not DDL: {sorted(list(in_sxml))}\n")
+            if mismatches:
+                log_f.write("  - Attribute Mismatches:\n")
+                for m in mismatches:
+                    log_f.write(f"    - Column '{m['column']}': {'; '.join(m['details'])}\n")
+            log_f.write("-->\n\n")
+            
+            log_f.write("<!-- Original DDL from .sql file -->\n")
+            log_f.write(ddl_content.strip() + "\n\n")
+            
+            dom_original = minidom.parseString(original_sxml)
+            ugly_xml_original = dom_original.toprettyxml(indent="  ")
+            good_lines_original = [line for line in ugly_xml_original.split('\n') if line.strip()]
+            formatted_sxml_original = "\n".join(good_lines_original)
+            log_f.write("<!-- Original SXML Metadata from snapshot -->\n")
+            log_f.write(formatted_sxml_original + "\n\n")
+
+            dom_corrected = minidom.parseString(corrected_sxml)
+            ugly_xml_corrected = dom_corrected.toprettyxml(indent="  ")
+            good_lines_corrected = [line for line in ugly_xml_corrected.split('\n') if line.strip()]
+            formatted_sxml_corrected = "\n".join(good_lines_corrected)
+            log_f.write("<!-- Final SXML Metadata (with fixes applied) -->\n")
+            log_f.write(formatted_sxml_corrected)
+        return f"INFO: Discrepancy details saved to: {log_file_path}"
+    except Exception as e:
+        return f"ERROR: Could not write log file. Reason: {e}"
 
 
 def process_single_file(file_path):
     """
     Reads a single SQL file, looks for the snapshot line, parses it,
     and if a fix is applied, it overwrites the original file.
-
-    Args:
-        file_path (str): The full path to the SQL file to process.
     """
     snapshot_prefix = "-- sqlcl_snapshot"
     messages = []
@@ -124,121 +284,62 @@ def process_single_file(file_path):
                 original_line_index = i
                 json_string = line.strip()[len(snapshot_prefix):].strip()
                 
-                if json_string:
+                if not json_string:
+                    messages.append(f"WARNING (Line {i+1}): Snapshot line is empty.")
+                    break
+                
+                try:
+                    data = json.loads(json_string)
+                    original_sxml = data.get("sxml")
+
+                    if not original_sxml:
+                        messages.append(f"WARNING (Line {i+1}): JSON data is missing the 'sxml' key.")
+                        break
+
+                    sxml_to_process = original_sxml
+                    
+                    # Step 1: Check if SXML is valid. If not, try to fix it.
                     try:
-                        data = json.loads(json_string)
-                        sxml_string = data.get("sxml")
-
-                        if sxml_string:
-                            sxml_to_check = sxml_string
-                            corrected_sxml = None
-                            
-                            try:
-                                ET.fromstring(sxml_string)
-                            except ET.ParseError as xml_err:
-                                # SXML parsing failed, attempt to fix it.
-                                open_count = sxml_string.count('<IDENTITY_COLUMN>')
-                                close_count = sxml_string.count('</IDENTITY_COLUMN>')
-
-                                # Attempt to fix missing </IDENTITY_COLUMN> and add new tags
-                                if open_count > close_count:
-                                    schema_match = re.search(r'<SCHEMA>(.*?)</SCHEMA>', sxml_string)
-                                    name_match = re.search(r'<NAME>(.*?)</NAME>', sxml_string)
-                                    if schema_match and name_match:
-                                        schema = schema_match.group(1)
-                                        table_name = name_match.group(1)
-                                        start_with_val = get_start_with_value(schema, table_name)
-                                        tags_to_add = f"""<GENERATION>DEFAULT</GENERATION><ON_NULL></ON_NULL><START_WITH>{start_with_val}</START_WITH><INCREMENT>1</INCREMENT><MINVALUE>1</MINVALUE><MAXVALUE>9999999999999999999999999999</MAXVALUE><CACHE>20</CACHE></IDENTITY_COLUMN>"""
-                                        
-                                        start_pos = sxml_string.find('<IDENTITY_COLUMN>')
-                                        schema_end_tag = '</SCHEMA>'
-                                        schema_end_pos = sxml_string.find(schema_end_tag, start_pos)
-                                        
-                                        if schema_end_pos != -1:
-                                            insertion_point = schema_end_pos + len(schema_end_tag)
-                                            temp_sxml = sxml_string[:insertion_point] + tags_to_add + sxml_string[insertion_point:]
-                                            try:
-                                                ET.fromstring(temp_sxml)
-                                                corrected_sxml = temp_sxml
-                                                messages.append(f"SUCCESS (Line {i+1}): File updated. Added missing tags and closing </IDENTITY_COLUMN>.")
-                                            except ET.ParseError: pass
-                                
-                                if corrected_sxml:
-                                    # Update the sxml value, but keep the original hash
-                                    data['sxml'] = corrected_sxml
-                                    sxml_to_check = corrected_sxml # Use the corrected version for the check
-                                    
-                                    updated_json_string = json.dumps(data, separators=(',', ':'))
-                                    lines[original_line_index] = f"-- sqlcl_snapshot {updated_json_string}\n"
-                                    file_was_modified = True
-                                else:
-                                    messages.append(f"ERROR (Line {i+1}): Unfixable SXML parse error. Reason: {xml_err}")
-                                    sxml_to_check = None # Can't check an unfixable SXML
-
-                            # Perform the DDL vs SXML comparison on the final version of the SXML
-                            if sxml_to_check:
-                                ddl_content = "".join(lines[:original_line_index])
-                                comparison_messages, in_ddl_not_in_sxml, in_sxml_not_in_ddl = compare_ddl_and_sxml_columns(ddl_content, sxml_to_check)
-                                
-                                has_discrepancy = bool(in_ddl_not_in_sxml or in_sxml_not_in_ddl)
-
-                                # If there's a problem, report it and create a log file.
-                                if file_was_modified or has_discrepancy:
-                                    messages.extend(comparison_messages)
-                                    
-                                    # If there was a discrepancy, create the log file with formatted SXML
-                                    if has_discrepancy:
-                                        try:
-                                            # Create the log file path
-                                            log_file_path = os.path.splitext(file_path)[0] + ".log"
-                                            
-                                            dom = minidom.parseString(sxml_to_check)
-                                            
-                                            # Mark columns that are in SXML but not DDL
-                                            col_list_items = dom.getElementsByTagName('COL_LIST_ITEM')
-                                            for item in col_list_items:
-                                                name_nodes = item.getElementsByTagName('NAME')
-                                                if name_nodes and name_nodes[0].firstChild:
-                                                    col_name = name_nodes[0].firstChild.nodeValue.upper()
-                                                    if col_name in in_sxml_not_in_ddl:
-                                                        comment = dom.createComment(f" COLUMN '{col_name}' IS MISSING FROM DDL ")
-                                                        item.parentNode.insertBefore(comment, item)
-
-                                            ugly_xml = dom.toprettyxml(indent="  ")
-                                            good_lines = [line for line in ugly_xml.split('\n') if line.strip()]
-                                            formatted_sxml = "\n".join(good_lines)
-                                            
-                                            with open(log_file_path, 'w', encoding='utf-8') as log_f:
-                                                # Write header comment with summary
-                                                log_f.write("<!--\n  Column Discrepancy Report\n\n")
-                                                if in_ddl_not_in_sxml:
-                                                    log_f.write(f"  - Columns in DDL but not SXML: {sorted(list(in_ddl_not_in_sxml))}\n")
-                                                if in_sxml_not_in_ddl:
-                                                    log_f.write(f"  - Columns in SXML but not DDL: {sorted(list(in_sxml_not_in_ddl))}\n")
-                                                log_f.write("-->\n\n")
-
-                                                # Write original DDL
-                                                log_f.write("<!-- Original DDL from .sql file -->\n")
-                                                log_f.write(ddl_content.strip() + "\n\n")
-                                                
-                                                # Write SXML
-                                                log_f.write("<!-- SXML Metadata from snapshot (with annotations) -->\n")
-                                                log_f.write(formatted_sxml)
-
-                                            messages.append(f"  INFO: Discrepancy details saved to: {log_file_path}")
-                                        except Exception as e:
-                                            messages.append(f"  ERROR: Could not write log file. Reason: {e}")
-
+                        ET.fromstring(sxml_to_process)
+                    except ET.ParseError as xml_err:
+                        corrected_sxml, fix_message = fix_identity_column(sxml_to_process)
+                        if corrected_sxml:
+                            sxml_to_process = corrected_sxml
+                            messages.append(f"SUCCESS (Line {i+1}): {fix_message}")
+                            file_was_modified = True
                         else:
-                            messages.append(f"WARNING (Line {i+1}): JSON data is missing the 'sxml' key.")
-                    except json.JSONDecodeError as json_err:
-                        messages.append(f"ERROR (Line {i+1}): Failed to parse JSON. Reason: {json_err}")
-                else:
-                    messages.append(f"WARNING (Line {i+1}): Snapshot line is empty and contains no JSON data.")
+                            messages.append(f"ERROR (Line {i+1}): {fix_message or f'Unfixable SXML parse error: {xml_err}'}")
+                            sxml_to_process = None # Stop processing this file
+
+                    # Step 2: If we have valid SXML, perform content validation and correction
+                    if sxml_to_process:
+                        ddl_content = "".join(lines[:original_line_index])
+                        comp_messages, in_ddl, in_sxml, mismatches = compare_ddl_and_sxml_columns(ddl_content, sxml_to_process)
+                        
+                        # Step 3: Add any columns that are missing from the SXML
+                        if in_ddl:
+                            sxml_to_process = add_missing_columns_to_sxml(in_ddl, ddl_content, sxml_to_process)
+                            messages.append(f"SUCCESS (Line {i+1}): Added missing columns to SXML: {sorted(list(in_ddl))}")
+                            file_was_modified = True
+
+                        # Step 4: Check for discrepancies to generate logs
+                        has_discrepancy = bool(in_ddl or in_sxml or mismatches)
+                        if has_discrepancy:
+                            messages.extend(comp_messages)
+                            discrepancies = (in_ddl, in_sxml, mismatches)
+                            log_message = generate_log_file(file_path, ddl_content, original_sxml, sxml_to_process, discrepancies)
+                            messages.append(f"  {log_message}")
+                    
+                    # Step 5: If any changes were made, update the file content
+                    if file_was_modified:
+                        data['sxml'] = sxml_to_process
+                        lines[original_line_index] = f"-- sqlcl_snapshot {json.dumps(data, separators=(',', ':'))}\n"
+
+                except json.JSONDecodeError as json_err:
+                    messages.append(f"ERROR (Line {i+1}): Failed to parse JSON. Reason: {json_err}")
                 
                 break # Only process first snapshot line
         
-        # If any corrections were made, write the changes back to the file.
         if file_was_modified:
             with open(file_path, 'w', encoding='utf-8') as f:
                 f.writelines(lines)
@@ -248,7 +349,6 @@ def process_single_file(file_path):
     except Exception as e:
         messages.append(f"ERROR: An unexpected error occurred: {e}")
 
-    # Only print anything if there are messages to report
     if messages:
         print(f"--- Issues found in file: {file_path} ---")
         for msg in messages:
@@ -256,12 +356,40 @@ def process_single_file(file_path):
         print("-" * (len(file_path) + 25) + "\n")
 
 
+def parse_sql_snapshot_files(root_folder):
+    if not os.path.isdir(root_folder):
+        print(f"Error: The specified folder '{root_folder}' does not exist or is not a directory.")
+        return
+
+    print("Cleaning up old .log files...")
+    log_files_removed = 0
+    for dirpath, _, filenames in os.walk(root_folder):
+        for filename in filenames:
+            if filename.endswith(".log"):
+                log_path = os.path.join(dirpath, filename)
+                try:
+                    os.remove(log_path)
+                    log_files_removed += 1
+                except OSError as e:
+                    print(f"  Warning: Could not remove log file '{log_path}'. Reason: {e}")
+    print(f"Removed {log_files_removed} old log file(s).")
+
+    print(f"\nStarting scan in folder: '{root_folder}'.")
+    print("IMPORTANT: This script will modify files in place if corrections are made.\n")
+
+    for dirpath, _, filenames in os.walk(root_folder):
+        for filename in filenames:
+            if filename.endswith(".sql"):
+                file_path = os.path.join(dirpath, filename)
+                process_single_file(file_path)
+
+
 if __name__ == "__main__":
     # --- IMPORTANT ---
     # Change this path to the folder you want to scan.
     # You can use a relative path (like './my_folder') or an
     # absolute path (like 'C:/Users/YourUser/Documents/sql_scripts').
-    target_directory = "./src/database/xxxx/tables" 
+    target_directory = "" 
     
     # Create a dummy folder and files for demonstration if the target doesn't exist
     if not os.path.exists(target_directory):
