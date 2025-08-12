@@ -254,8 +254,23 @@ def fix_identity_not_null(sxml_string):
             return sxml_string.replace(id_col_block, corrected_block), "Added missing NOT NULL tag to ID column."
     return None, None
 
+def reset_start_with_value(sxml_string):
+    """
+    Resets the START_WITH value in an IDENTITY_COLUMN to 1 if it's not already 1.
+    
+    Returns:
+        tuple: (corrected_sxml, was_changed, original_value)
+    """
+    start_with_match = re.search(r'(<START_WITH>)(\d+)(</START_WITH>)', sxml_string)
+    if start_with_match:
+        original_value = start_with_match.group(2)
+        if original_value != '1':
+            corrected_sxml = sxml_string.replace(start_with_match.group(0), f'<START_WITH>1</START_WITH>')
+            return corrected_sxml, True, original_value
+    return sxml_string, False, None
 
-def generate_log_file(file_path, ddl_content, original_sxml, corrected_sxml, discrepancies):
+
+def generate_log_file(file_path, ddl_content, original_sxml, corrected_sxml, discrepancies, fixes_applied):
     """
     Creates a detailed .log file for a given SQL file with discrepancies.
     """
@@ -263,7 +278,11 @@ def generate_log_file(file_path, ddl_content, original_sxml, corrected_sxml, dis
     try:
         log_file_path = os.path.splitext(file_path)[0] + ".log"
         with open(log_file_path, 'w', encoding='utf-8') as log_f:
-            log_f.write("<!--\n  Discrepancy Report\n\n")
+            log_f.write("<!--\n  Discrepancy and Fix Report\n\n")
+            if fixes_applied:
+                log_f.write("  - Fixes Applied:\n")
+                for fix in fixes_applied:
+                    log_f.write(f"    - {fix}\n")
             if in_ddl:
                 log_f.write(f"  - Columns in DDL but not SXML: {sorted(list(in_ddl))}\n")
             if in_sxml:
@@ -295,7 +314,7 @@ def generate_log_file(file_path, ddl_content, original_sxml, corrected_sxml, dis
         return f"ERROR: Could not write log file. Reason: {e}"
 
 
-def process_single_file(file_path):
+def process_single_file(file_path, reset_start_with_flag):
     """
     Reads a single SQL file, looks for the snapshot line, parses it,
     and if a fix is applied, it overwrites the original file.
@@ -307,6 +326,7 @@ def process_single_file(file_path):
             lines = f.readlines()
 
         file_was_modified = False
+        fixes_applied_for_log = []
         
         for i, line in enumerate(lines):
             if line.strip().startswith(snapshot_prefix):
@@ -335,6 +355,7 @@ def process_single_file(file_path):
                         if corrected_sxml:
                             sxml_to_process = corrected_sxml
                             messages.append(f"SUCCESS (Line {i+1}): {fix_message}")
+                            fixes_applied_for_log.append("Fixed missing IDENTITY_COLUMN tag.")
                             file_was_modified = True
                         else:
                             messages.append(f"ERROR (Line {i+1}): {fix_message or f'Unfixable SXML parse error: {xml_err}'}")
@@ -351,6 +372,7 @@ def process_single_file(file_path):
                         if initial_in_ddl:
                             sxml_to_process = add_missing_columns_to_sxml(initial_in_ddl, ddl_content, sxml_to_process)
                             messages.append(f"SUCCESS (Line {i+1}): Added missing columns to SXML: {sorted(list(initial_in_ddl))}")
+                            fixes_applied_for_log.append(f"Added missing columns: {sorted(list(initial_in_ddl))}")
                             file_was_modified = True
 
                         # Step 4: Fix missing NOT NULL on ID column
@@ -360,21 +382,31 @@ def process_single_file(file_path):
                             if corrected_sxml:
                                 sxml_to_process = corrected_sxml
                                 messages.append(f"SUCCESS (Line {i+1}): {fix_message}")
+                                fixes_applied_for_log.append("Added NOT NULL to ID column.")
                                 file_was_modified = True
 
-                        # Step 5: Check for discrepancies to generate logs
-                        has_initial_discrepancy = bool(initial_in_ddl or initial_in_sxml or initial_mismatches)
+                        # Step 5: Reset START_WITH value if flag is set
+                        if reset_start_with_flag:
+                            sxml_to_process, was_reset, old_val = reset_start_with_value(sxml_to_process)
+                            if was_reset:
+                                reset_message = f"Reset START_WITH value from '{old_val}' to '1'."
+                                messages.append(f"SUCCESS (Line {i+1}): {reset_message}")
+                                fixes_applied_for_log.append(reset_message)
+                                file_was_modified = True
 
-                        if file_was_modified or has_initial_discrepancy:
-                            # Use the initial discrepancies for the report header
-                            discrepancies_for_log = (initial_in_ddl, initial_in_sxml, initial_mismatches)
-                            if has_initial_discrepancy:
-                                messages.extend(initial_comp_messages)
+                        # Step 6: Check for discrepancies to generate logs
+                        final_comp_messages, final_in_ddl, final_in_sxml, final_mismatches = compare_ddl_and_sxml_columns(ddl_content, sxml_to_process)
+                        has_discrepancy = bool(final_in_ddl or final_in_sxml or final_mismatches)
+
+                        if file_was_modified or has_discrepancy:
+                            discrepancies_for_log = (final_in_ddl, final_in_sxml, final_mismatches)
+                            if has_discrepancy:
+                                messages.extend(final_comp_messages)
                             
-                            log_message = generate_log_file(file_path, ddl_content, original_sxml, sxml_to_process, discrepancies_for_log)
+                            log_message = generate_log_file(file_path, ddl_content, original_sxml, sxml_to_process, discrepancies_for_log, fixes_applied_for_log)
                             messages.append(f"  {log_message}")
                     
-                    # Step 6: If any changes were made, update the file content
+                    # Step 7: If any changes were made, update the file content
                     if file_was_modified:
                         data['sxml'] = sxml_to_process
                         lines[original_line_index] = f"-- sqlcl_snapshot {json.dumps(data, separators=(',', ':'))}\n"
@@ -400,7 +432,7 @@ def process_single_file(file_path):
         print("-" * (len(file_path) + 25) + "\n")
 
 
-def parse_sql_snapshot_files(root_folder):
+def parse_sql_snapshot_files(root_folder, reset_start_with_flag):
     if not os.path.isdir(root_folder):
         print(f"Error: The specified folder '{root_folder}' does not exist or is not a directory.")
         return
@@ -425,7 +457,7 @@ def parse_sql_snapshot_files(root_folder):
         for filename in filenames:
             if filename.endswith(".sql"):
                 file_path = os.path.join(dirpath, filename)
-                process_single_file(file_path)
+                process_single_file(file_path, reset_start_with_flag)
 
 
 if __name__ == "__main__":
@@ -435,6 +467,13 @@ if __name__ == "__main__":
     # absolute path (like 'C:/Users/YourUser/Documents/sql_scripts').
     target_directory = "" 
     
+       # --- OPTIONAL FLAG ---
+    # Set this to True to reset all START_WITH values in identity columns to 1.
+    # Set to False to leave them as they are.
+    reset_start_with_flag = True
+
+
+
     # Create a dummy folder and files for demonstration if the target doesn't exist
     if not os.path.exists(target_directory):
         print(f"'{target_directory}' not found. Creating a demo setup...")
@@ -459,4 +498,4 @@ if __name__ == "__main__":
             f.write("CREATE VIEW my_view AS SELECT 1 FROM DUAL;\n")
             
     # Run the main function
-    parse_sql_snapshot_files(target_directory)
+    parse_sql_snapshot_files(target_directory,reset_start_with_flag)
