@@ -59,6 +59,11 @@ def add_missing_columns_to_sxml(missing_columns, ddl_string, sxml_string):
             item_xml += '        <COLLATE_NAME>USING_NLS_COMP</COLLATE_NAME>\n'
         elif type_def_upper.startswith('BLOB'):
             item_xml += '        <DATATYPE>BLOB</DATATYPE>\n'
+        elif type_def_upper.startswith('TIMESTAMP'):
+            item_xml += '        <DATATYPE>TIMESTAMP_WITH_LOCAL_TIMEZONE</DATATYPE>\n'
+            scale_match = re.search(r'\((\d+)\)', col_def)
+            if scale_match:
+                item_xml += f'        <SCALE>{scale_match.group(1)}</SCALE>\n'
 
         if 'NOT NULL' in type_def_upper:
             item_xml += '        <NOT_NULL></NOT_NULL>\n'
@@ -128,6 +133,11 @@ def compare_ddl_and_sxml_columns(ddl_string, sxml_string):
                 ddl_cols[name]['type'] = 'CLOB'
             elif type_def.startswith('BLOB'):
                 ddl_cols[name]['type'] = 'BLOB'
+            elif type_def.startswith('TIMESTAMP'):
+                ddl_cols[name]['type'] = 'TIMESTAMP_WITH_LOCAL_TIMEZONE'
+                scale_match = re.search(r'\((\d+)\)', definition)
+                if scale_match:
+                    ddl_cols[name]['scale'] = scale_match.group(1)
 
     # 2. Parse SXML to extract detailed column attributes
     try:
@@ -227,6 +237,23 @@ def fix_identity_column(sxml_string):
                     return None, "SXML still invalid after IDENTITY_COLUMN fix."
     return None, None
 
+def fix_identity_not_null(sxml_string):
+    """
+    Adds a missing NOT_NULL tag to an IDENTITY column if required.
+    """
+    # Find the COL_LIST_ITEM for the ID column
+    id_col_match = re.search(r'(<COL_LIST_ITEM>\s*<NAME>ID</NAME>.*?)(</COL_LIST_ITEM>)', sxml_string, re.DOTALL)
+    if id_col_match:
+        id_col_block = id_col_match.group(1)
+        # Check if NOT_NULL is missing and IDENTITY_COLUMN is present
+        if '<NOT_NULL/>' not in id_col_block and '<IDENTITY_COLUMN>' in id_col_block:
+            # Insert NOT_NULL after the IDENTITY_COLUMN block
+            identity_end_tag = '</IDENTITY_COLUMN>'
+            insertion_point = id_col_block.find(identity_end_tag) + len(identity_end_tag)
+            corrected_block = id_col_block[:insertion_point] + '\n        <NOT_NULL/>' + id_col_block[insertion_point:]
+            return sxml_string.replace(id_col_block, corrected_block), "Added missing NOT NULL tag to ID column."
+    return None, None
+
 
 def generate_log_file(file_path, ddl_content, original_sxml, corrected_sxml, discrepancies):
     """
@@ -316,23 +343,38 @@ def process_single_file(file_path):
                     # Step 2: If we have valid SXML, perform content validation and correction
                     if sxml_to_process:
                         ddl_content = "".join(lines[:original_line_index])
-                        comp_messages, in_ddl, in_sxml, mismatches = compare_ddl_and_sxml_columns(ddl_content, sxml_to_process)
+                        
+                        # Initial comparison to find what needs fixing
+                        initial_comp_messages, initial_in_ddl, initial_in_sxml, initial_mismatches = compare_ddl_and_sxml_columns(ddl_content, sxml_to_process)
                         
                         # Step 3: Add any columns that are missing from the SXML
-                        if in_ddl:
-                            sxml_to_process = add_missing_columns_to_sxml(in_ddl, ddl_content, sxml_to_process)
-                            messages.append(f"SUCCESS (Line {i+1}): Added missing columns to SXML: {sorted(list(in_ddl))}")
+                        if initial_in_ddl:
+                            sxml_to_process = add_missing_columns_to_sxml(initial_in_ddl, ddl_content, sxml_to_process)
+                            messages.append(f"SUCCESS (Line {i+1}): Added missing columns to SXML: {sorted(list(initial_in_ddl))}")
                             file_was_modified = True
 
-                        # Step 4: Check for discrepancies to generate logs
-                        has_discrepancy = bool(in_ddl or in_sxml or mismatches)
-                        if has_discrepancy:
-                            messages.extend(comp_messages)
-                            discrepancies = (in_ddl, in_sxml, mismatches)
-                            log_message = generate_log_file(file_path, ddl_content, original_sxml, sxml_to_process, discrepancies)
+                        # Step 4: Fix missing NOT NULL on ID column
+                        id_not_null_mismatch = any(m['column'] == 'ID' and "NOT NULL mismatch" in ''.join(m['details']) for m in initial_mismatches)
+                        if id_not_null_mismatch:
+                            corrected_sxml, fix_message = fix_identity_not_null(sxml_to_process)
+                            if corrected_sxml:
+                                sxml_to_process = corrected_sxml
+                                messages.append(f"SUCCESS (Line {i+1}): {fix_message}")
+                                file_was_modified = True
+
+                        # Step 5: Check for discrepancies to generate logs
+                        has_initial_discrepancy = bool(initial_in_ddl or initial_in_sxml or initial_mismatches)
+
+                        if file_was_modified or has_initial_discrepancy:
+                            # Use the initial discrepancies for the report header
+                            discrepancies_for_log = (initial_in_ddl, initial_in_sxml, initial_mismatches)
+                            if has_initial_discrepancy:
+                                messages.extend(initial_comp_messages)
+                            
+                            log_message = generate_log_file(file_path, ddl_content, original_sxml, sxml_to_process, discrepancies_for_log)
                             messages.append(f"  {log_message}")
                     
-                    # Step 5: If any changes were made, update the file content
+                    # Step 6: If any changes were made, update the file content
                     if file_was_modified:
                         data['sxml'] = sxml_to_process
                         lines[original_line_index] = f"-- sqlcl_snapshot {json.dumps(data, separators=(',', ':'))}\n"
@@ -384,8 +426,6 @@ def parse_sql_snapshot_files(root_folder):
             if filename.endswith(".sql"):
                 file_path = os.path.join(dirpath, filename)
                 process_single_file(file_path)
-
-
 
 
 if __name__ == "__main__":
