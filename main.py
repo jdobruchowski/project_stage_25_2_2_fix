@@ -28,11 +28,11 @@ def add_missing_columns_to_sxml(missing_columns, ddl_string, sxml_string):
     for col_name in missing_columns:
         # Find the full definition line for the missing column
         # This regex looks for a line starting with the quoted column name
-        col_def_match = re.search(r'^\s*"' + re.escape(col_name) + r'"\s+(.*?)(,|$)', columns_block, re.MULTILINE | re.IGNORECASE)
+        col_def_match = re.search(r'^\s*"' + re.escape(col_name) + r'"\s+(.*)', columns_block, re.MULTILINE | re.IGNORECASE)
         if not col_def_match:
             continue
 
-        col_def = col_def_match.group(1).strip()
+        col_def = col_def_match.group(1).strip().rstrip(',')
         
         # Build the SXML fragment for this column
         item_xml = f'      <COL_LIST_ITEM>\n        <NAME>{col_name}</NAME>\n'
@@ -48,7 +48,7 @@ def add_missing_columns_to_sxml(missing_columns, ddl_string, sxml_string):
             item_xml += '        <COLLATE_NAME>USING_NLS_COMP</COLLATE_NAME>\n'
         elif type_def_upper.startswith('NUMBER'):
             item_xml += '        <DATATYPE>NUMBER</DATATYPE>\n'
-            precision_match = re.search(r'\((\d+),(\d+)\)', col_def)
+            precision_match = re.search(r'NUMBER\((\d+),(\d+)\)', type_def_upper)
             if precision_match:
                 item_xml += f'        <PRECISION>{precision_match.group(1)}</PRECISION>\n'
                 item_xml += f'        <SCALE>{precision_match.group(2)}</SCALE>\n'
@@ -99,24 +99,26 @@ def compare_ddl_and_sxml_columns(ddl_string, sxml_string):
     if create_table_match:
         columns_block = create_table_match.group(1)
         # Regex to capture column name and its full definition on the same line
-        col_definitions = re.findall(r'^\s*"([^"]+)"\s+(.*?)(?:,|$)', columns_block, re.MULTILINE | re.IGNORECASE)
+        col_definitions = re.findall(r'^\s*"([^"]+)"\s+(.*)', columns_block, re.MULTILINE | re.IGNORECASE)
         for name, definition in col_definitions:
             name = name.upper()
+            definition = definition.strip().rstrip(',')
             ddl_cols[name] = {'not_null': 'NOT NULL' in definition.upper()}
             
-            type_def = definition.split()[0].upper()
+            type_def = definition.upper().split()[0]
             if type_def.startswith('VARCHAR2'):
                 ddl_cols[name]['type'] = 'VARCHAR2'
                 length_match = re.search(r'\((\d+)', definition)
                 ddl_cols[name]['length'] = length_match.group(1) if length_match else None
             elif type_def.startswith('NUMBER'):
                 ddl_cols[name]['type'] = 'NUMBER'
-                match = re.match(r'NUMBER\((\d+),(\d+)\)', type_def)
+                # Use re.search on the whole definition to be more robust
+                match = re.search(r'NUMBER\((\d+),(\d+)\)', definition, re.IGNORECASE)
                 if match:
                     ddl_cols[name]['precision'] = match.group(1)
                     ddl_cols[name]['scale'] = match.group(2)
                 else:
-                    match = re.match(r'NUMBER\((\d+)\)', type_def)
+                    match = re.search(r'NUMBER\((\d+)\)', definition, re.IGNORECASE)
                     if match:
                         ddl_cols[name]['precision'] = match.group(1)
                         ddl_cols[name]['scale'] = '0' # Oracle default
@@ -382,6 +384,8 @@ def parse_sql_snapshot_files(root_folder):
             if filename.endswith(".sql"):
                 file_path = os.path.join(dirpath, filename)
                 process_single_file(file_path)
+
+
 
 
 if __name__ == "__main__":
