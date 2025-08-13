@@ -3,6 +3,118 @@ import json
 import xml.etree.ElementTree as ET
 import re
 from xml.dom import minidom
+import subprocess
+
+# --- You will need these two helper functions ---
+def are_sxml_semantically_equal(sxml_str1, sxml_str2):
+    """
+    Compares two SXML strings for semantic equality using a robust
+    normalization method that strips all whitespace between tags.
+    """
+    try:
+        # First, remove the XML declaration which can have inconsistent formatting
+        sxml_str1 = re.sub(r'<\?xml.*?\?>', '', sxml_str1).strip()
+        sxml_str2 = re.sub(r'<\?xml.*?\?>', '', sxml_str2).strip()
+
+        # Use regex to replace any whitespace (\s+) ONLY between tags (><)
+        normalized_str1 = re.sub(r'>\s+<', '><', sxml_str1)
+        normalized_str2 = re.sub(r'>\s+<', '><', sxml_str2)
+
+        # Now, compare the correctly normalized strings
+        return normalized_str1 == normalized_str2
+    except Exception:
+        return False
+
+# --- The Main Function with the Loop ---
+def get_git_diff(file_path,repo):
+    """
+    Iteratively runs git diff and applies fixes until the diff is clean
+    or contains an unfixable, meaningful change.
+    """
+    applied_fixes = []
+    final_diff_output = ""
+    # A safety break to prevent any theoretical infinite loops
+    if file_path == '/Users/jdobruchowski/Documents/Git/Praca/BeachCourse/beachcourse/project/src/database/gen/tables/inventory_detail.log':
+         t=1
+
+    for _ in range(5): 
+        try:
+            repo_directory = os.path.dirname(file_path)
+            command = ['git', '-C', repo_directory, 'diff', '--unified=0', repo, '--', file_path]
+            result = subprocess.run(command, capture_output=True, text=True, check=False)
+
+            if result.returncode != 0 and result.stderr:
+                return f"Git command failed.\nError:\n{result.stderr}"
+        except Exception as e:
+            return f"An unexpected error occurred during git diff: {e}"
+
+        current_diff = result.stdout
+        final_diff_output = current_diff
+
+        # --- Exit Condition 1: The diff is clean ---
+        if not current_diff:
+            break
+        # --- Fix Condition 2: "No Newline" Warning ---
+        if '\\ No newline at end of file' in current_diff:
+                pos_warning = current_diff.find(r'\ No newline at end of file')
+                pos_snapshot = current_diff.find('+-- sqlcl_snapshot')
+                if pos_warning != -1 and pos_snapshot != -1:
+                    if pos_warning < pos_snapshot:
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                        with open(file_path, 'w', encoding='utf-8') as f:
+                                f.write(content.rstrip())
+                    else:
+                         with open(file_path, 'a', encoding='utf-8') as f:
+                            f.write('\n')          
+                    applied_fixes.append("Git Fix Applied: Corrected trailing newline issue.")
+                    continue # Restart the loop to check again
+
+
+
+        # --- Fix Condition 1: Cosmetic SXML Change ---
+        changed_lines = [line for line in current_diff.splitlines() if line.startswith('+-- sqlcl_snapshot ') or line.startswith('--- sqlcl_snapshot ')]
+        if len(changed_lines) == 2 and changed_lines[0].startswith('--- ') and changed_lines[1].startswith('+-- '):
+            old_line = changed_lines[0][1:]
+            new_line = changed_lines[1][1:]
+            if old_line.strip().startswith('-- sqlcl_snapshot'):
+                try:
+                    original_sxml = json.loads(old_line.strip()[len('-- sqlcl_snapshot'):].strip()).get('sxml', '')
+                    perfected_sxml = json.loads(new_line.strip()[len('-- sqlcl_snapshot'):].strip()).get('sxml', '')
+                    if are_sxml_semantically_equal(original_sxml, perfected_sxml):
+                        corrected_line = old_line
+                        
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            file_content_lines = f.readlines()
+                        for i, line in enumerate(file_content_lines):
+                            if line.strip() == new_line.strip():
+                                file_content_lines[i] = corrected_line + '\n'
+                                break
+                        with open(file_path, 'w', encoding='utf-8') as f:
+                            f.writelines(file_content_lines)
+                        
+                        applied_fixes.append("Git Fix Applied: Synchronized SXML formatting with repo.")
+                        continue # Restart the loop to check again
+                except Exception:
+                    raise
+                    pass # If parsing fails, it's not a simple cosmetic fix
+
+
+        # --- Exit Condition 2: Unfixable Diff ---
+        # If we reach here, we found a diff but couldn't fix it. Exit the loop.
+        break
+
+    # --- Assemble the final report ---
+    report = ""
+    if applied_fixes:
+        report += "\n".join(applied_fixes) + "\n\n"
+    
+    if not final_diff_output:
+        report += "Git diff: Files are the same."
+    else:
+        report += "--- Final Diff ---\n" + final_diff_output
+
+    return report
 
 def reorder_sxml_columns_to_match_ddl(ddl_string, sxml_string):
     """
@@ -279,97 +391,122 @@ def reset_start_with_value(sxml_string):
     return sxml_string, False, None
 
 
-def generate_log_file(file_path, ddl_content, original_sxml, corrected_sxml, discrepancies, fixes_applied):
+def generate_log_file(file_path, ddl_content, original_sxml, corrected_sxml, discrepancies, fixes_applied, git_diff_output=None):
     """
-    Generates a log file detailing the changes made.
-    **MODIFIED to show old and new column order in the summary.**
+    Generates a complete log file with all features:
+    1. Summary of changes at the top.
+    2. Detailed old/new order for reorder fixes.
+    3. Robust parsing for potentially malformed original SXML.
+    4. Appended Git diff against the 'main' branch.
     """
-    in_ddl, in_sxml, mismatches = discrepancies
     try:
         log_file_path = os.path.splitext(file_path)[0] + ".log"
         with open(log_file_path, 'w', encoding='utf-8') as log_f:
             
+            # Feature 1 & 2: Summary of Changes with Reorder Detail
             if fixes_applied:
                 log_f.write("--- Summary of Changes ---\n")
                 for fix in fixes_applied:
-                    # Print the main message for every fix
                     log_f.write(f"- {fix.get('message', 'An undescribed fix was applied.')}\n")
-
-                    # --- START OF THE NEW MODIFICATION ---
-                    # If the fix was a reorder, add the specific order details
                     if fix.get('type') == 'reorder':
                         old_order_str = ", ".join(fix.get('old_order', []))
                         new_order_str = ", ".join(fix.get('new_order', []))
                         log_f.write(f"    - Original Order: {old_order_str}\n")
                         log_f.write(f"    - New Order:      {new_order_str}\n")
-                    # --- END OF THE NEW MODIFICATION ---
-
                 log_f.write("--------------------------\n\n")
 
-            # Added headers to the existing sections for better readability
+            # DDL Section
             log_f.write("--- DDL ---\n")
             log_f.write(ddl_content.strip() + "\n\n")
             
+            # Feature 3: Robust "Original SXML" Printing
             log_f.write("--- Original SXML (Before) ---\n")
-            dom_original = minidom.parseString(original_sxml)
-            ugly_xml_original = dom_original.toprettyxml(indent="  ")
-            good_lines_original = [line for line in ugly_xml_original.split('\n') if line.strip()]
-            formatted_sxml_original = "\n".join(good_lines_original)
-            log_f.write(formatted_sxml_original + "\n\n")
+            try:
+                # Attempt to pretty-print the XML as normal
+                dom_original = minidom.parseString(original_sxml)
+                ugly_xml_original = dom_original.toprettyxml(indent="  ")
+                good_lines_original = [line for line in ugly_xml_original.split('\n') if line.strip()]
+                formatted_sxml_original = "\n".join(good_lines_original)
+                log_f.write(formatted_sxml_original + "\n\n")
+            except Exception as e:
+                # If parsing fails, write a note and print the raw string
+                log_f.write("\n")
+                log_f.write(f"\n")
+                log_f.write(original_sxml + "\n\n")
 
+            # Corrected SXML Section
             log_f.write("--- Corrected SXML (After) ---\n")
-            dom_corrected = minidom.parseString(corrected_sxml)
-            ugly_xml_corrected = dom_corrected.toprettyxml(indent="  ")
-            good_lines_corrected = [line for line in ugly_xml_corrected.split('\n') if line.strip()]
-            formatted_sxml_corrected = "\n".join(good_lines_corrected)
-            log_f.write(formatted_sxml_corrected)
+            try:
+                dom_corrected = minidom.parseString(corrected_sxml)
+                ugly_xml_corrected = dom_corrected.toprettyxml(indent="  ")
+                good_lines_corrected = [line for line in ugly_xml_corrected.split('\n') if line.strip()]
+                formatted_sxml_corrected = "\n".join(good_lines_corrected)
+                log_f.write(formatted_sxml_corrected)
+            except Exception as e:
+                # If parsing fails, write a note and print the raw string
+                log_f.write("\n")
+                log_f.write(f"\n")
+                log_f.write(corrected_sxml + "\n\n")
+
+            # Feature 4: Git Diff Section
+            if git_diff_output:
+                log_f.write(f"\n\n--- Git Diff vs. {repo} Branch ---\n")
+                log_f.write(git_diff_output)
 
         return f"INFO: Discrepancy details saved to: {log_file_path}"
     except Exception as e:
         return f"ERROR: Could not write log file. Reason: {e}"
     
-def process_single_file(file_path, reset_start_with_flag):
+def process_single_file(file_path, reset_start_with_flag,repo):
     snapshot_prefix = "-- sqlcl_snapshot"
     messages = []
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
 
-        file_was_modified = False
-        fixes_applied_for_log = []
-        
+        original_line_index = -1
+        # Find the snapshot line index first
         for i, line in enumerate(lines):
             if line.strip().startswith(snapshot_prefix):
                 original_line_index = i
-                json_string = line.strip()[len(snapshot_prefix):].strip()
-                
-                if not json_string:
-                    messages.append(f"WARNING (Line {i+1}): Snapshot line is empty.")
-                    break
-                
-                try:
-                    data = json.loads(json_string)
-                    original_sxml = data.get("sxml")
+                break
+        
+        # If no snapshot line is found, there's nothing to process
+        if original_line_index == -1:
+            return
 
-                    if not original_sxml:
-                        messages.append(f"WARNING (Line {i+1}): JSON data is missing the 'sxml' key.")
-                        break
+        file_was_modified = False
+        fixes_applied_for_log = []
+        
+        json_string = lines[original_line_index].strip()[len(snapshot_prefix):].strip()
+        
+        if not json_string:
+            messages.append(f"WARNING (Line {original_line_index + 1}): Snapshot line is empty.")
+        else:
+            try:
+                data = json.loads(json_string)
+                original_sxml = data.get("sxml")
 
+                if not original_sxml:
+                    messages.append(f"WARNING (Line {original_line_index + 1}): JSON data is missing the 'sxml' key.")
+                else:
                     sxml_to_process = original_sxml
                     
+                    # Attempt to parse, and fix if there's a known error
                     try:
                         ET.fromstring(sxml_to_process)
                     except ET.ParseError as xml_err:
                         corrected_sxml, fix_message = fix_identity_column(sxml_to_process)
                         if corrected_sxml:
                             sxml_to_process = corrected_sxml
-                            messages.append(f"SUCCESS (Line {i+1}): {fix_message}")
+                            messages.append(f"SUCCESS (Line {original_line_index + 1}): {fix_message}")
                             fixes_applied_for_log.append({'message': "Fixed missing IDENTITY_COLUMN tag."})
                             file_was_modified = True
                         else:
-                            messages.append(f"ERROR (Line {i+1}): {fix_message or f'Unfixable SXML parse error: {xml_err}'}")
+                            messages.append(f"ERROR (Line {original_line_index + 1}): {fix_message or f'Unfixable SXML parse error: {xml_err}'}")
                             sxml_to_process = None
 
+                    # Proceed with fixes only if SXML is valid or was successfully fixed
                     if sxml_to_process:
                         ddl_content = "".join(lines[:original_line_index])
                         
@@ -378,7 +515,7 @@ def process_single_file(file_path, reset_start_with_flag):
                         if initial_in_ddl:
                             sxml_to_process = add_missing_columns_to_sxml(initial_in_ddl, ddl_content, sxml_to_process)
                             msg = f"Added missing columns to SXML: {sorted(list(initial_in_ddl))}"
-                            messages.append(f"SUCCESS (Line {i+1}): {msg}")
+                            messages.append(f"SUCCESS (Line {original_line_index + 1}): {msg}")
                             fixes_applied_for_log.append({'message': f"Added missing columns: {sorted(list(initial_in_ddl))}"})
                             file_was_modified = True
 
@@ -387,7 +524,7 @@ def process_single_file(file_path, reset_start_with_flag):
                             corrected_sxml, fix_message = fix_identity_not_null(sxml_to_process)
                             if corrected_sxml:
                                 sxml_to_process = corrected_sxml
-                                messages.append(f"SUCCESS (Line {i+1}): {fix_message}")
+                                messages.append(f"SUCCESS (Line {original_line_index + 1}): {fix_message}")
                                 fixes_applied_for_log.append({'message': "Added NOT NULL to ID column."})
                                 file_was_modified = True
 
@@ -395,14 +532,14 @@ def process_single_file(file_path, reset_start_with_flag):
                             sxml_to_process, was_reset, old_val = reset_start_with_value(sxml_to_process)
                             if was_reset:
                                 reset_message = f"Reset START_WITH value from '{old_val}' to '1'."
-                                messages.append(f"SUCCESS (Line {i+1}): {reset_message}")
+                                messages.append(f"SUCCESS (Line {original_line_index + 1}): {reset_message}")
                                 fixes_applied_for_log.append({'message': reset_message})
                                 file_was_modified = True
 
                         sxml_to_process, was_reordered, old_order, new_order = reorder_sxml_columns_to_match_ddl(ddl_content, sxml_to_process)
                         if was_reordered:
                             reorder_message = "Corrected SXML column order to match DDL."
-                            messages.append(f"SUCCESS (Line {i+1}): {reorder_message}")
+                            messages.append(f"SUCCESS (Line {original_line_index + 1}): {reorder_message}")
                             fixes_applied_for_log.append({
                                 'type': 'reorder',
                                 'message': reorder_message,
@@ -411,30 +548,41 @@ def process_single_file(file_path, reset_start_with_flag):
                             })
                             file_was_modified = True
 
+                        # --- Final logic for saving, diffing, and logging ---
                         final_comp_messages, final_in_ddl, final_in_sxml, final_mismatches = compare_ddl_and_sxml_columns(ddl_content, sxml_to_process)
                         has_discrepancy = bool(final_in_ddl or final_in_sxml or final_mismatches)
+                        
+                        git_diff_content = None
+                        
+                        if file_was_modified:
+                            data['sxml'] = sxml_to_process
+                            lines[original_line_index] = f"-- sqlcl_snapshot {json.dumps(data, separators=(',', ':'))}\n"
+                            
+                            # 1. Save the modified file to disk
+                            with open(file_path, 'w', encoding='utf-8') as f:
+                                f.writelines(lines)
+                            
+                            # 2. Get the Git diff of the saved file
+                        
+                        git_diff_content = get_git_diff(file_path,repo)
+                        is_diff_clean = (git_diff_content == "Git diff: Files are the same.")
 
-                        if file_was_modified or has_discrepancy:
+                        # 3. Generate the comprehensive log
+                        if file_was_modified or has_discrepancy or not is_diff_clean:
                             discrepancies_for_log = (final_in_ddl, final_in_sxml, final_mismatches)
                             if has_discrepancy:
                                 messages.extend(final_comp_messages)
                             
-                            log_message = generate_log_file(file_path, ddl_content, original_sxml, sxml_to_process, discrepancies_for_log, fixes_applied_for_log)
+                            log_message = generate_log_file(
+                                file_path, ddl_content, original_sxml, sxml_to_process,
+                                discrepancies_for_log, fixes_applied_for_log,
+                                git_diff_output=git_diff_content
+                            )
                             messages.append(f"  {log_message}")
-                    
-                    if file_was_modified:
-                        data['sxml'] = sxml_to_process
-                        lines[original_line_index] = f"-- sqlcl_snapshot {json.dumps(data, separators=(',', ':'))}\n"
 
-                except json.JSONDecodeError as json_err:
-                    messages.append(f"ERROR (Line {i+1}): Failed to parse JSON. Reason: {json_err}")
+            except json.JSONDecodeError as json_err:
+                messages.append(f"ERROR (Line {original_line_index + 1}): Failed to parse JSON. Reason: {json_err}")
                 
-                break
-        
-        if file_was_modified:
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.writelines(lines)
-
     except IOError as e:
         messages.append(f"ERROR: Could not read file. Reason: {e}")
     except Exception as e:
@@ -447,7 +595,7 @@ def process_single_file(file_path, reset_start_with_flag):
         print("-" * (len(file_path) + 25) + "\n")
 
 
-def parse_sql_snapshot_files(root_folder, reset_start_with_flag):
+def parse_sql_snapshot_files(root_folder, reset_start_with_flag,repo):
     if not os.path.isdir(root_folder):
         print(f"Error: The specified folder '{root_folder}' does not exist or is not a directory.")
         return
@@ -472,21 +620,21 @@ def parse_sql_snapshot_files(root_folder, reset_start_with_flag):
         for filename in filenames:
             if filename.endswith(".sql"):
                 file_path = os.path.join(dirpath, filename)
-                process_single_file(file_path, reset_start_with_flag)
+                process_single_file(file_path, reset_start_with_flag,repo)
 
 if __name__ == "__main__":
     # --- IMPORTANT ---
     # Change this path to the folder you want to scan.
     # You can use a relative path (like './my_folder') or an
     # absolute path (like 'C:/Users/YourUser/Documents/sql_scripts').
-    target_directory = "/Users/jdobruchowski/Documents/Git/Praca/BeachCourse/beachcourse/project/src/database/gen/tables" 
+    target_directory = "" 
     
        # --- OPTIONAL FLAG ---
     # Set this to True to reset all START_WITH values in identity columns to 1.
     # Set to False to leave them as they are.
     reset_start_with_flag = True
-
-
+    # Set this to the branch you want to compare agains
+    repo ='main'
 
     # Create a dummy folder and files for demonstration if the target doesn't exist
     if not os.path.exists(target_directory):
@@ -512,4 +660,4 @@ if __name__ == "__main__":
             f.write("CREATE VIEW my_view AS SELECT 1 FROM DUAL;\n")
             
     # Run the main function
-    parse_sql_snapshot_files(target_directory,reset_start_with_flag)
+    parse_sql_snapshot_files(target_directory,reset_start_with_flag,repo)
