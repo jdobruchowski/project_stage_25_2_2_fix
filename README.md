@@ -48,7 +48,9 @@ For convenience, you can set default values in a `config.cfg` file placed in the
 ```ini
 [settings]
 # The root folder to scan for .sql files.
-target_directory = /path/to/your/project/src/database/gen/tables
+
+target_directory = /path/to/your/project/src/database/xxxx/tables
+
 
 # Set to 'true' to reset START_WITH values, 'false' otherwise.
 reset_start_with = true
@@ -78,7 +80,9 @@ python main.py [target_directory] [--reset-start-with | --no-reset-start-with] [
 
 ```bash
 # Scan a directory with default options
-python main.py /path/to/your/project/src/database/gen/tables
+
+python main.py /path/to/your/project/src/database/xxxx/tables
+
 
 # Scan a directory, reset identity columns, and compare against the 'develop' branch
 python main.py ./sql_files --reset-start-with --repo develop
