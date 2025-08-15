@@ -4,7 +4,7 @@ import xml.etree.ElementTree as ET
 import re
 from xml.dom import minidom
 import subprocess
-
+import configparser
 # --- You will need these two helper functions ---
 def are_sxml_semantically_equal(sxml_str1, sxml_str2):
     """
@@ -34,9 +34,6 @@ def get_git_diff(file_path,repo):
     applied_fixes = []
     final_diff_output = ""
     # A safety break to prevent any theoretical infinite loops
-    if file_path == '/Users/jdobruchowski/Documents/Git/Praca/BeachCourse/beachcourse/project/src/database/gen/tables/inventory_detail.log':
-         t=1
-
     for _ in range(5): 
         try:
             repo_directory = os.path.dirname(file_path)
@@ -623,41 +620,69 @@ def parse_sql_snapshot_files(root_folder, reset_start_with_flag,repo):
                 process_single_file(file_path, reset_start_with_flag,repo)
 
 if __name__ == "__main__":
-    # --- IMPORTANT ---
-    # Change this path to the folder you want to scan.
-    # You can use a relative path (like './my_folder') or an
-    # absolute path (like 'C:/Users/YourUser/Documents/sql_scripts').
-    target_directory = "" 
+    import argparse
     
-       # --- OPTIONAL FLAG ---
-    # Set this to True to reset all START_WITH values in identity columns to 1.
-    # Set to False to leave them as they are.
-    reset_start_with_flag = True
-    # Set this to the branch you want to compare agains
-    repo ='main'
+    CONFIG_FILE = 'config.cfg'
 
-    # Create a dummy folder and files for demonstration if the target doesn't exist
-    if not os.path.exists(target_directory):
-        print(f"'{target_directory}' not found. Creating a demo setup...")
-        os.makedirs(os.path.join(target_directory, "subfolder"))
+    def read_config():
+        """Reads settings from config.cfg, providing fallbacks."""
+        config = configparser.ConfigParser()
+        # Read the config file. It's okay if it doesn't exist.
+        config.read(CONFIG_FILE)
         
-        # File 1: Valid case
-        with open(os.path.join(target_directory, "good_file.sql"), "w") as f:
-            f.write("SELECT * FROM employees;\n")
-            f.write('-- sqlcl_snapshot {"hash":"abcde12345","type":"TABLE","name":"EMPLOYEES","schemaName":"HR","sxml":"<TABLE DDL_VERSION=\\"2\\"><COL_LIST><COL_LIST_ITEM>...</COL_LIST_ITEM></COL_LIST>"}\n')
-            f.write("SELECT * FROM departments;\n")
-
-        # File 2: Invalid JSON
-        with open(os.path.join(target_directory, "bad_json.sql"), "w") as f:
-            f.write('-- sqlcl_snapshot {"hash":"fghij67890", "sxml": "<root/>",,}\n')
-
-        # File 3: Invalid SXML
-        with open(os.path.join(target_directory, "subfolder", "bad_sxml.sql"), "w") as f:
-            f.write('-- sqlcl_snapshot {"hash":"klmno11223","sxml":"<root><unclosed-tag></root>"}\n')
+        settings = {}
+        if 'settings' in config:
+            # Use .get() to avoid errors if a key is missing
+            settings['target_directory'] = config['settings'].get('target_directory')
+            settings['reset_start_with'] = config['settings'].getboolean('reset_start_with', fallback=False)
+            settings['repo'] = config['settings'].get('repo', fallback='main')
+        else:
+            # Fallback if [settings] section is missing or file is empty/non-existent
+            settings['target_directory'] = None
+            settings['reset_start_with'] = False
+            settings['repo'] = 'main'
             
-        # File 4: No snapshot line
-        with open(os.path.join(target_directory, "subfolder", "no_snapshot.sql"), "w") as f:
-            f.write("CREATE VIEW my_view AS SELECT 1 FROM DUAL;\n")
-            
-    # Run the main function
-    parse_sql_snapshot_files(target_directory,reset_start_with_flag,repo)
+        return settings
+
+    # 1. Read defaults from the config file first
+    config_defaults = read_config()
+    
+    parser = argparse.ArgumentParser(
+        description="Fixes and validates Oracle SQLcl snapshot files.",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog=f"""
+Example usage:
+  python main.py
+  python main.py /path/to/your/files --no-reset-start-with --repo develop
+
+Configuration Precedence:
+  1. Command-line arguments (e.g., --repo develop)
+  2. Values in {CONFIG_FILE} (if present)
+  3. Script defaults (repo='main', no reset)
+"""
+    )
+    parser.add_argument(
+        "target_directory",
+        nargs='?', # Makes the positional argument optional
+        default=config_defaults['target_directory'],
+        help=f"The root folder to scan. Overrides 'target_directory' in {CONFIG_FILE}."
+    )
+    parser.add_argument(
+        "--reset-start-with",
+        action=argparse.BooleanOptionalAction,
+        default=config_defaults['reset_start_with'],
+        help=f"Reset START_WITH to 1. Overrides 'reset_start_with' in {CONFIG_FILE}."
+    )
+    parser.add_argument(
+        "--repo",
+        default=config_defaults['repo'],
+        help=f"Git branch to compare against. Overrides 'repo' in {CONFIG_FILE}."
+    )
+    args = parser.parse_args()
+
+    # After parsing, check if target_directory was resolved
+    if not args.target_directory:
+        parser.error(f"A target directory is required. Provide it as an argument or set 'target_directory' in {CONFIG_FILE}.")
+
+    # Run the main function with the resolved arguments
+    parse_sql_snapshot_files(args.target_directory, args.reset_start_with, args.repo)
