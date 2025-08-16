@@ -1,4 +1,3 @@
-
 # SQLcl Snapshot Validator and Fixer
 
 ## Purpose
@@ -47,10 +46,9 @@ For convenience, you can set default values in a `config.cfg` file placed in the
 **Example `config.cfg`:**
 ```ini
 [settings]
-# The root folder to scan for .sql files.
-
-target_directory = /path/to/your/project/src/database/xxxx/tables
-
+# One or more root folders to scan for .sql files.
+# Multiple directories can be specified, separated by commas.
+target_directory = /path/to/dir1, /path/to/dir2, /path/to/dir3
 
 # Set to 'true' to reset START_WITH values, 'false' otherwise.
 reset_start_with = true
@@ -59,33 +57,31 @@ reset_start_with = true
 repo = main
 ```
 
-### How to Run
+## How to Run
 
-The script is run from the command line. It determines which folder to scan based on the following order of precedence:
+The script is run from the command line. It determines which folders to scan based on the following order of precedence:
 
-1.  A directory path provided as a command-line argument.
-2.  The `target_directory` value specified in `config.cfg`.
+1.  One or more directory paths provided as command-line arguments.
+2.  The `target_directory` value specified in `config.cfg` (supports multiple, comma-separated directories).
 
 **Syntax:**
 ```bash
-python main.py [target_directory] [--reset-start-with | --no-reset-start-with] [--repo <branch_name>]
+python main.py [target_directory ...] [--reset-start-with | --no-reset-start-with] [--repo <branch_name>]
 ```
 
 **Arguments:**
-*   `<target_directory>`: (Required) The path to the folder you want to scan.
+*   `<target_directory ...>`: (Required) One or more paths to folders you want to scan. You can specify multiple directories separated by spaces.
 *   `--reset-start-with`: (Optional) If present, resets all `START WITH` values in identity columns to 1.
 *   `--repo <branch_name>`: (Optional) The name of the git branch to compare against. Defaults to `main`.
 
 **Examples:**
 
 ```bash
-# Scan a directory with default options
+# Scan multiple directories with default options
+python main.py /path/to/dir1 /path/to/dir2 /path/to/dir3
 
-python main.py /path/to/your/project/src/database/xxxx/tables
-
-
-# Scan a directory, reset identity columns, and compare against the 'develop' branch
-python main.py ./sql_files --reset-start-with --repo develop
+# Scan multiple directories, reset identity columns, and compare against the 'develop' branch
+python main.py ./sql_files ./other_sql --reset-start-with --repo develop
 ```
 
 ### **Use Git\!**
