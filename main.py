@@ -622,50 +622,48 @@ def parse_sql_snapshot_files(root_folder, reset_start_with_flag,repo):
 if __name__ == "__main__":
     import argparse
     
-    CONFIG_FILE = 'config.cfg'
-
+    CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.cfg')
+    
     def read_config():
         """Reads settings from config.cfg, providing fallbacks."""
         config = configparser.ConfigParser()
-        # Read the config file. It's okay if it doesn't exist.
         config.read(CONFIG_FILE)
-        
         settings = {}
         if 'settings' in config:
-            # Use .get() to avoid errors if a key is missing
-            settings['target_directory'] = config['settings'].get('target_directory')
+            # Accept comma-separated directories in config
+            dirs = config['settings'].get('target_directory')
+            if dirs:
+                settings['target_directories'] = [d.strip() for d in dirs.split(',')]
+            else:
+                settings['target_directories'] = []
             settings['reset_start_with'] = config['settings'].getboolean('reset_start_with', fallback=False)
             settings['repo'] = config['settings'].get('repo', fallback='main')
         else:
-            # Fallback if [settings] section is missing or file is empty/non-existent
-            settings['target_directory'] = None
+            settings['target_directories'] = []
             settings['reset_start_with'] = False
             settings['repo'] = 'main'
-            
         return settings
 
     # 1. Read defaults from the config file first
     config_defaults = read_config()
-    
     parser = argparse.ArgumentParser(
         description="Fixes and validates Oracle SQLcl snapshot files.",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog=f"""
 Example usage:
-  python main.py
-  python main.py /path/to/your/files --no-reset-start-with --repo develop
+  python main.py /dir1 /dir2 --no-reset-start-with --repo develop
 
 Configuration Precedence:
   1. Command-line arguments (e.g., --repo develop)
-  2. Values in {CONFIG_FILE} (if present)
+  2. Values in {CONFIG_FILE} (comma-separated for multiple directories)
   3. Script defaults (repo='main', no reset)
 """
     )
     parser.add_argument(
-        "target_directory",
-        nargs='?', # Makes the positional argument optional
-        default=config_defaults['target_directory'],
-        help=f"The root folder to scan. Overrides 'target_directory' in {CONFIG_FILE}."
+        "target_directories",
+        nargs='*', # Accept zero or more directories
+        default=config_defaults['target_directories'],
+        help=f"One or more root folders to scan. Overrides 'target_directory' in {CONFIG_FILE}."
     )
     parser.add_argument(
         "--reset-start-with",
@@ -680,12 +678,20 @@ Configuration Precedence:
     )
     args = parser.parse_args()
 
-    # After parsing, check if target_directory was resolved
-    if not args.target_directory:
-        parser.error(f"A target directory is required. Provide it as an argument or set 'target_directory' in {CONFIG_FILE}.")
+    # After parsing, check if target_directories were resolved
+    if not args.target_directories:
+        parser.error(f"At least one target directory is required. Provide as arguments or set 'target_directory' in {CONFIG_FILE}.")
     if not args.repo:
         parser.error(f"A target repo is required. Provide it as an argument or set 'repo' in {CONFIG_FILE}.")
 
+    # Normalize all directories to absolute paths
+    abs_dirs = []
+    for d in args.target_directories:
+        if not os.path.isabs(d):
+            abs_dirs.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), d))
+        else:
+            abs_dirs.append(d)
 
-    # Run the main function with the resolved arguments
-    parse_sql_snapshot_files(args.target_directory, args.reset_start_with, args.repo)
+    # Run the main function for each directory
+    for directory in abs_dirs:
+        parse_sql_snapshot_files(directory, args.reset_start_with, args.repo)
