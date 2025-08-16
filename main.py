@@ -388,7 +388,7 @@ def reset_start_with_value(sxml_string):
     return sxml_string, False, None
 
 
-def generate_log_file(file_path, ddl_content, original_sxml, corrected_sxml, discrepancies, fixes_applied, git_diff_output=None):
+def generate_log_file(file_path, ddl_content, original_sxml, corrected_sxml, discrepancies, fixes_applied, repo ,git_diff_output=None):
     """
     Generates a complete log file with all features:
     1. Summary of changes at the top.
@@ -572,7 +572,7 @@ def process_single_file(file_path, reset_start_with_flag,repo):
                             
                             log_message = generate_log_file(
                                 file_path, ddl_content, original_sxml, sxml_to_process,
-                                discrepancies_for_log, fixes_applied_for_log,
+                                discrepancies_for_log, fixes_applied_for_log,repo,
                                 git_diff_output=git_diff_content
                             )
                             messages.append(f"  {log_message}")
@@ -683,6 +683,9 @@ Configuration Precedence:
     # After parsing, check if target_directory was resolved
     if not args.target_directory:
         parser.error(f"A target directory is required. Provide it as an argument or set 'target_directory' in {CONFIG_FILE}.")
+    if not args.repo:
+        parser.error(f"A target repo is required. Provide it as an argument or set 'repo' in {CONFIG_FILE}.")
+
 
     # Run the main function with the resolved arguments
     parse_sql_snapshot_files(args.target_directory, args.reset_start_with, args.repo)
